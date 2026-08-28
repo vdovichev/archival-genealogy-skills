@@ -25,6 +25,10 @@
   oai     BASE ГЛАГОЛ [--set S] [--prefix oai_edm] [--id ID] [--from Y-M-D]
           OAI-PMH: GET-вход в портал оцифровки, работает и там, где поиск только POST.
           BASE — например https://<портал>/oai/OAIHandler
+  post    URL --json ТЕЛО [--referer R]
+          POST-запрос к внутреннему шлюзу поиска. Нужен, когда поиск портала сделан
+          не ссылкой, а запросом с телом (Elasticsearch и подобные) — см. RECIPES.md,
+          «Поиск, спрятанный за POST».
   cdx     ДОМЕН [--filter .pdf]        что осталось от мёртвого сайта в веб-архиве
   probe   URL...                       живой ли адрес: код, редиректы, тип, сертификат
 
@@ -219,6 +223,40 @@ def cmd_epav_id(a):
           "ЗАВЕДОМО оцифрованное дело — иначе пустой ответ ничего не доказывает")
 
 
+# ----------------------------------------------------------------- POST
+def cmd_post(a):
+    """Поиск через POST. Тело берётся как есть — его форму выясняют по бандлу сайта."""
+    hdrs = {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"}
+    if a.referer:
+        hdrs["Referer"] = a.referer
+    else:                       # многие шлюзы отвечают 403 без Referer со своего же сайта
+        u = urllib.parse.urlsplit(a.url)
+        hdrs["Referer"] = f"{u.scheme}://{u.netloc}/"
+    body = a.json
+    if body.startswith("@"):
+        body = open(body[1:], encoding="utf-8").read()
+    st, hd, raw = get(a.url, data=body.encode(), headers=hdrs, insecure=a.insecure)
+    print(f"# HTTP {st}  {a.url}")
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        print(raw.decode("utf-8", "replace")[:2000]); return
+    hits = d.get("hits") if isinstance(d, dict) else None
+    if isinstance(hits, dict):                      # ответ в стиле Elasticsearch
+        total = hits.get("total")
+        if isinstance(total, dict):
+            total = total.get("value")
+        print(f"# найдено: {total}")
+        for h in hits.get("hits", [])[:20]:
+            s = h.get("_source", {})
+            keep = {k: v for k, v in s.items() if v not in (None, "", [], {})}
+            head = " · ".join(f"{k}={keep[k]}" for k in list(keep)[:6])
+            print(f"{h.get('_type','')} {h.get('_id','')}  {head[:170]}")
+        print("# поля записи смотреть целиком: они содержат шифр и МЕСТО РОЖДЕНИЯ")
+    else:
+        print(json.dumps(d, ensure_ascii=False, indent=1)[:3000])
+
+
 # ------------------------------------------------------------------ OAI
 def cmd_oai(a):
     """OAI-PMH — недооценённый вход: чистый GET, без ключа и без POST.
@@ -317,6 +355,11 @@ def main():
     p.add_argument("--set"); p.add_argument("--prefix", default="oai_edm")
     p.add_argument("--id", dest="ident"); p.add_argument("--from", dest="dt_from")
     p.set_defaults(f=cmd_oai)
+
+    p = sub.add_parser("post"); p.add_argument("url")
+    p.add_argument("--json", required=True, help="тело запроса (или @файл)")
+    p.add_argument("--referer")
+    p.set_defaults(f=cmd_post)
 
     p = sub.add_parser("cdx"); p.add_argument("domain")
     p.add_argument("--filter"); p.add_argument("--limit", type=int, default=200)
