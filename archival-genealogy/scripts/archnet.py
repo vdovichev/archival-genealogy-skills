@@ -4,6 +4,10 @@
 Стандартная библиотека, без зависимостей. Все запросы — GET/POST поиска;
 ничего не создаёт и не изменяет на стороне источника.
 
+⚠️ Источник закрыт по географии? Поднимите SOCKS одной командой, ничего не устанавливая
+на удалённой машине:  `ssh -D 11080 -N you@узел-в-нужной-стране`  — и добавьте к любой
+команде `--socks 127.0.0.1:11080`.
+
 ⚠️ Требует выхода в сеть. В песочнице без интернета (веб-чат) команды вернут
 ошибку соединения — это не поломка скрипта. Там пользуйтесь скиллом как
 справочником, а запросы выполняйте в среде с сетью.
@@ -30,11 +34,78 @@
   archnet.py epav "Rajuny" --fulltext
   archnet.py cdx someschool.example.lt --filter .pdf
 """
-import argparse, json, re, ssl, sys, urllib.parse, urllib.request
+import argparse, http.client, json, re, socket, ssl, struct, sys, urllib.parse, urllib.request
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/126.0 Safari/537.36")
 TIMEOUT = 60
+
+
+# ------------------------------------------------------- SOCKS5 без зависимостей
+class _Socks5Connection(http.client.HTTPSConnection):
+    """HTTPS через SOCKS5-прокси. Нужен, когда источник закрыт по географии:
+    `ssh -D <порт> -N you@узел-в-стране` поднимает такой прокси без установки чего-либо
+    на самом узле. Разрешение имени отдаётся прокси (аналог socks5h)."""
+    proxy = None                       # (host, port) — ставится в set_socks()
+
+    def connect(self):
+        self.sock = self._context.wrap_socket(_socks_connect(self), server_hostname=self.host)
+
+
+def _socks_connect(conn):
+    """Рукопожатие SOCKS5 и возврат готового сокета (без TLS)."""
+    ph, pp = _Socks5Connection.proxy
+    s = socket.create_connection((ph, pp), conn.timeout)
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00":
+        raise OSError(f"SOCKS5 {ph}:{pp} не принял соединение без пароля")
+    host = conn.host.encode("idna")
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", conn.port))
+    rep = s.recv(4)
+    if len(rep) < 2 or rep[1] != 0:
+        code = rep[1] if len(rep) > 1 else -1
+        raise OSError(f"SOCKS5 отказал (код {code}) при подключении к {conn.host}:{conn.port}")
+    atyp = rep[3]
+    s.recv(4 if atyp == 1 else (16 if atyp == 4 else s.recv(1)[0]))
+    s.recv(2)
+    return s
+
+
+class _Socks5PlainConnection(http.client.HTTPConnection):
+    """Тот же прокси для обычного http:// — иначе часть запросов молча пошла бы напрямую
+    и «работает» означало бы «работает мимо туннеля»."""
+    def connect(self):
+        self.sock = _socks_connect(self)
+
+
+class _Socks5Handler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(self._make, req)
+
+    def _make(self, host, **kw):
+        kw.pop("context", None)
+        return _Socks5Connection(host, context=self._context, **kw)
+
+
+class _Socks5PlainHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_Socks5PlainConnection, req)
+
+
+def set_socks(spec, insecure=False):
+    """spec — 'host:port'. Ставит SOCKS-обработчик глобально для urllib."""
+    h, _, p = spec.rpartition(":")
+    _Socks5Connection.proxy = (h or "127.0.0.1", int(p))
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    hnd = _Socks5Handler()
+    hnd._context = ctx
+    _Socks5Connection._context = ctx
+    urllib.request.install_opener(urllib.request.build_opener(hnd, _Socks5PlainHandler()))
+    print(f"# трафик идёт через SOCKS5 {_Socks5Connection.proxy[0]}:"
+          f"{_Socks5Connection.proxy[1]}", file=sys.stderr)
 
 
 def get(url, data=None, headers=None, insecure=False, timeout=TIMEOUT):
@@ -222,6 +293,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--insecure", action="store_true",
                     help="не проверять TLS-сертификат (у части архивов своя цепочка)")
+    ap.add_argument("--socks", metavar="HOST:PORT",
+                    help="слать запросы через SOCKS5 (например, 127.0.0.1:11080 от "
+                         "`ssh -D 11080 -N узел-в-стране`) — обход блокировки по географии")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("af"); p.add_argument("base"); p.add_argument("query")
@@ -253,6 +327,8 @@ def main():
     a = ap.parse_args()
     if not hasattr(a, "insecure"):
         a.insecure = False
+    if getattr(a, "socks", None):
+        set_socks(a.socks, a.insecure)
     a.f(a)
 
 

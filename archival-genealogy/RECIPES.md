@@ -3,7 +3,9 @@
 > **Инструменты.** Всё, что ниже показано командами оболочки, продублировано
 > Python-скриптами в `scripts/` — они не требуют ImageMagick, poppler и curl
 > и работают в песочнице исполнения кода: `python3 scripts/archimg.py --help`,
-> `python3 scripts/archnet.py --help`. Соответствие приёмов и команд — `scripts/README.md`.
+> `python3 scripts/archnet.py --help`. Источник закрыт по географии — поднимите SOCKS
+> одной командой `ssh -D 11080 -N you@узел-в-стране` (на самом узле ставить **ничего**
+> не нужно, хватает штатного sshd) и добавьте `--socks 127.0.0.1:11080`. Соответствие приёмов и команд — `scripts/README.md`.
 
 Проверенные приёмы доступа, скачивания и просмотра. Все команды — POSIX shell + ImageMagick +
 poppler-utils + python3.
