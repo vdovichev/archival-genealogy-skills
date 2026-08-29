@@ -4,6 +4,10 @@
 Стандартная библиотека, без зависимостей. Все запросы — GET/POST поиска;
 ничего не создаёт и не изменяет на стороне источника.
 
+⚠️ Запросы идут ПО ОЧЕРЕДИ и с паузой: у региональных архивов доступ к образам платный,
+и скорость, непохожую на человека, они блокируют. Не запускайте несколько копий сразу
+и не уменьшайте `--delay`. Получили 429 или внезапный 403 — остановитесь, а не повторяйте.
+
 ⚠️ Источник закрыт по географии? Поднимите SOCKS одной командой, ничего не устанавливая
 на удалённой машине:  `ssh -D 11080 -N you@узел-в-нужной-стране`  — и добавьте к любой
 команде `--socks 127.0.0.1:11080`.
@@ -38,7 +42,41 @@
   archnet.py epav "Rajuny" --fulltext
   archnet.py cdx someschool.example.lt --filter .pdf
 """
-import argparse, http.client, json, re, socket, ssl, struct, sys, urllib.parse, urllib.request
+import argparse, http.client, json, random, re, socket, ssl, struct, sys, time
+import urllib.error, urllib.parse, urllib.request
+
+# --------------------------------------------------------------- темп запросов
+# Региональные архивы с ПЛАТНЫМ доступом к образам считают запросы и блокируют за
+# скорость, непохожую на человека. Пауза — не хитрость против блокировки, а условие
+# честной работы: быстрее человека читать никто не разрешал, а массовая выгрузка
+# оплаченного доступа — это его обход. Значения по умолчанию, в секундах.
+PACE_DEFAULT = 1.5
+PACE = {
+    "spbarchives.ru": 6.0,          # блокирует за серию запросов, снимается не сразу
+    "cgamos.ru": 4.0,
+    "gato.tularegion.ru": 3.0,
+    "pokolenia.permkrai.ru": 3.0,
+    "archive.pskov.ru": 3.0,
+    "yandex.ru": 3.0,
+}
+_last = {}
+DELAY_OVERRIDE = None
+
+
+def pace(host, override=None):
+    """Выдержать паузу перед запросом к этому хосту. Джиттер — чтобы интервалы
+    не были машинно-ровными."""
+    d = override if override is not None else PACE.get(host, PACE_DEFAULT)
+    if d <= 0:
+        return
+    prev = _last.get(host)
+    now = time.monotonic()
+    if prev is not None:
+        wait = d + random.uniform(0, d * 0.4) - (now - prev)
+        if wait > 0:
+            time.sleep(wait)
+    _last[host] = time.monotonic()
+
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/126.0 Safari/537.36")
@@ -112,7 +150,7 @@ def set_socks(spec, insecure=False):
           f"{_Socks5Connection.proxy[1]}", file=sys.stderr)
 
 
-def get(url, data=None, headers=None, insecure=False, timeout=TIMEOUT):
+def get(url, data=None, headers=None, insecure=False, timeout=TIMEOUT, delay=None):
     # часть сайтов отдаёт 403 на «голый» запрос: нужен полный набор заголовков браузера
     h = {"User-Agent": UA,
          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -122,6 +160,8 @@ def get(url, data=None, headers=None, insecure=False, timeout=TIMEOUT):
     body = None
     if data is not None:
         body = data.encode() if isinstance(data, str) else data
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    pace(host, delay if delay is not None else DELAY_OVERRIDE)
     req = urllib.request.Request(url, data=body, headers=h)
     ctx = None
     if insecure:
@@ -130,8 +170,17 @@ def get(url, data=None, headers=None, insecure=False, timeout=TIMEOUT):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-        return r.status, r.headers, r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (429, 403, 503):
+            # архив сказал «хватит»: не повторять сразу и не наращивать темп
+            print(f"# {e.code} от {host} — источник ограничил доступ. "
+                  f"ОСТАНОВИТЬСЯ, а не повторять: пауза от 15 минут, дальше вдвое реже "
+                  f"(--delay). Продолжение серии превращает ограничение в блокировку.",
+                  file=sys.stderr)
+        raise
 
 
 def _text(html, limit=None):
@@ -331,6 +380,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--insecure", action="store_true",
                     help="не проверять TLS-сертификат (у части архивов своя цепочка)")
+    ap.add_argument("--delay", type=float, metavar="СЕК",
+                    help="пауза между запросами к одному хосту (по умолчанию 1.5 с, "
+                         "у архивов с платным доступом — больше). НЕ уменьшать "
+                         "и не запускать несколько копий параллельно")
     ap.add_argument("--socks", metavar="HOST:PORT",
                     help="слать запросы через SOCKS5 (например, 127.0.0.1:11080 от "
                          "`ssh -D 11080 -N узел-в-стране`) — обход блокировки по географии")
@@ -368,6 +421,8 @@ def main():
     p = sub.add_parser("probe"); p.add_argument("urls", nargs="+"); p.set_defaults(f=cmd_probe)
 
     a = ap.parse_args()
+    global DELAY_OVERRIDE
+    DELAY_OVERRIDE = getattr(a, "delay", None)
     if not hasattr(a, "insecure"):
         a.insecure = False
     if getattr(a, "socks", None):
