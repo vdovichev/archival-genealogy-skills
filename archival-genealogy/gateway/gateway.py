@@ -13,7 +13,7 @@
   * в лог не пишется тело ответа.
 Стандартная библиотека, без зависимостей.
 """
-import http.server, json, os, re, socket, ssl, sys, threading, time
+import base64, binascii, http.server, json, os, re, socket, ssl, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 TOKEN   = os.environ.get("GW_TOKEN", "")
@@ -156,8 +156,52 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def unpack(seg):
+        """Цель приходит хвостом пути, а не параметром: некоторые загрузчики режут
+        строку запроса целиком, и до сервера доходит голый /g/<секрет>.
+        Понимаем два вида хвоста: base64url (без ? и & вовсе — самый надёжный)
+        и обычный адрес как есть."""
+        seg = seg.lstrip("/")
+        if not seg:
+            return ""
+        if seg.startswith("http://") or seg.startswith("https://"):
+            return seg
+        low = seg.lower()
+        if low.startswith("http%3a") or low.startswith("https%3a"):
+            return urllib.parse.unquote(seg)
+        try:
+            pad = "=" * (-len(seg) % 4)
+            d = base64.urlsafe_b64decode(seg + pad).decode("utf-8")
+            return d if d.startswith(("http://", "https://")) else ""
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return ""
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
+        if TOKEN and u.path.startswith(f"/gwar/{TOKEN}"):
+            tail = u.path[len(f"/gwar/{TOKEN}"):].lstrip("/")
+            if tail:                       # параметры пришли хвостом пути, в base64url
+                try:
+                    pad = "=" * (-len(tail) % 4)
+                    u = u._replace(query=base64.urlsafe_b64decode(tail + pad).decode("utf-8"))
+                except Exception:
+                    return self.json_out(400, {"error": "хвост пути не разобран",
+                                               "ожидается": "base64url от строки параметров"})
+            if not rate_ok():
+                return self.deny(429)
+            try:
+                code, obj = gwar_search(urllib.parse.parse_qs(u.query))
+            except Exception as e:
+                code, obj = 502, {"error": type(e).__name__, "detail": str(e)[:200]}
+            return self.json_out(code, obj)
+
+        if TOKEN and u.path.startswith(f"/g/{TOKEN}/"):
+            target = self.unpack(u.path[len(f"/g/{TOKEN}"):])
+            if u.query:                    # хвост пути + уцелевшая строка запроса
+                target += ("&" if "?" in target else "?") + u.query
+            return self.fetch(target)
+
         if TOKEN and u.path == f"/gwar/{TOKEN}":
             if not rate_ok():
                 return self.deny(429)
@@ -168,7 +212,14 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.json_out(code, obj)
         if not TOKEN or u.path != f"/g/{TOKEN}":
             return self.deny()
-        target = urllib.parse.parse_qs(u.query).get("url", [""])[0]
+        return self.fetch(urllib.parse.parse_qs(u.query).get("url", [""])[0])
+
+    def fetch(self, target):
+        if not target:
+            return self.json_out(400, {
+                "error": "адрес не получен",
+                "подсказка": "строку запроса режут некоторые загрузчики — передавайте "
+                             "цель хвостом пути: /g/<секрет>/<адрес в base64url>"})
         t = urllib.parse.urlparse(target)
         if t.scheme not in ("http", "https") or not t.hostname or t.port:
             return self.deny(400)
