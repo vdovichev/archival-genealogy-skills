@@ -19,6 +19,9 @@ import urllib.error, urllib.parse, urllib.request
 TOKEN   = os.environ.get("GW_TOKEN", "")
 PORT    = int(os.environ.get("GW_PORT", "80"))
 BUNDLE  = os.environ.get("GW_CA", "/opt/gw/ru-ca-bundle.pem")
+BASE    = os.environ.get("GW_BASE", "").rstrip("/")   # публичный адрес шлюза:
+# ссылки в ответе делаем АБСОЛЮТНЫМИ — часть загрузчиков берёт только те адреса,
+# которые встретились в тексте целиком, и относительный /g/... до них не доходит
 MAXSIZE = 12 * 1024 * 1024
 RATE    = 60                      # запросов в минуту суммарно
 TIMEOUT = 45
@@ -77,6 +80,98 @@ def ctx():
     return c
 
 
+# ------------------------------------------------- переписывание ссылок в ответе
+# Ассистент в браузере умеет загружать только адреса, которые дословно встретились
+# ему в переписке или в уже полученном ответе, — собрать новый он не может.
+# Поэтому страница бесполезна, если ссылки в ней ведут «наружу»: относительный
+# /awards загрузчик разрешит против НАШЕГО хоста и получит 404. Переписываем каждую
+# ссылку в полный вид /g/<секрет>/<base64url абсолютного адреса>, и тогда навигация
+# разворачивается сама: одна входная страница даёт доступ ко всему разделу.
+LINK_RE = re.compile(rb'(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)\2', re.I | re.S)
+IMG_RE = re.compile(rb'(<(?:img|script|link)\b[^>]*?\b(?:src|href)\s*=\s*)(["\'])(.*?)\2', re.I | re.S)
+
+
+def b64(s):
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+
+def gw_link(absolute):
+    return f"{BASE}/g/{TOKEN}/{b64(absolute)}"
+
+
+def rewrite_html(body, base_url):
+    def fix_a(m):
+        raw = m.group(3).decode("utf-8", "replace").strip()
+        if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return m.group(0)
+        absolute = urllib.parse.urljoin(base_url, raw)
+        pr = urllib.parse.urlparse(absolute)
+        if pr.scheme not in ("http", "https") or not pr.hostname or not allowed(pr.hostname):
+            return m.group(0)                      # чужой домен оставляем как есть
+        return m.group(1) + m.group(2) + gw_link(absolute).encode() + m.group(2)
+
+    def fix_asset(m):
+        # картинки и стили НЕ гоним через шлюз: они съедали бы лимит запросов.
+        # Просто делаем адрес абсолютным, чтобы он не бил в наш хост.
+        raw = m.group(3).decode("utf-8", "replace").strip()
+        if not raw or raw.startswith(("#", "data:", "http://", "https://", "//")):
+            return m.group(0)
+        return m.group(1) + m.group(2) + urllib.parse.urljoin(base_url, raw).encode() + m.group(2)
+
+    body = LINK_RE.sub(fix_a, body)
+    return IMG_RE.sub(fix_asset, body)
+
+
+# ---------------------------------------------------------------- точка входа
+# Одна страница, адрес которой человек даёт ассистенту в переписке. Дальше тот
+# ходит ТОЛЬКО по ссылкам отсюда — этого достаточно, чтобы развернуть поиск.
+ENTRY = [
+    ("Каталоги дел архивов", [
+        ("Госархив Тамбовской обл. (движок КАИСА)", "https://kaisa.tambovarchiv.ru/"),
+        ("Госархив Ивановской обл.", "https://ivarh.ru/"),
+        ("Госархив Владимирской обл.", "https://vlarhiv.ru/"),
+        ("Госархив Ярославской обл.", "https://yararchive.ru/"),
+        ("Госархив Псковской обл.", "https://archive.pskov.ru/"),
+        ("Архивы Санкт-Петербурга", "https://spbarchives.ru/"),
+        ("ЦГА Москвы", "https://cgamos.ru/"),
+        ("Пермский край: Поколения", "https://pokolenia.permkrai.ru/"),
+        ("РГАДА", "https://rgada.ru/"),
+        ("Портал «Архивы России»", "https://rusarchives.ru/"),
+    ]),
+    ("Именные базы", [
+        ("Первая мировая: потери и награды", "https://gwar.mil.ru/"),
+        ("Георгиевские кавалеры", "https://cavalier.rusarchives.ru/"),
+        ("Открытый список (репрессии)", "https://ru.openlist.wiki/"),
+        ("Бессмертный полк", "https://www.moypolk.ru/"),
+        ("Память народа", "https://pamyat-naroda.ru/"),
+    ]),
+    ("Книги, справочники, изображения", [
+        ("Историческая библиотека (ГПИБ)", "https://elib.shpl.ru/ru/nodes/search"),
+        ("Национальная электронная библиотека", "https://rusneb.ru/"),
+        ("Госкаталог музейного фонда", "https://goskatalog.ru/"),
+        ("Электронекрасовка", "https://electro.nekrasovka.ru/"),
+        ("Родная Вятка", "https://rodnaya-vyatka.ru/"),
+    ]),
+]
+
+
+def entry_page():
+    h = ["<!doctype html><meta charset=utf-8><title>Архивный шлюз</title>",
+         "<h1>Архивный шлюз</h1>",
+         "<p>Ниже — входы в архивные источники. Ходите по этим ссылкам: они уже "
+         "в рабочем виде. Ссылки внутри полученных страниц тоже переписаны, "
+         "поэтому навигация работает вглубь.</p>",
+         "<p>Поиск по фамилии обычно задаётся параметрами адреса, а их ваш загрузчик "
+         "срезает. Если нужна страница результатов — попросите человека прислать "
+         "готовую ссылку: он соберёт её одной командой.</p>"]
+    for title, items in ENTRY:
+        h.append(f"<h2>{title}</h2><ul>")
+        for name, url in items:
+            h.append(f'<li><a href="{gw_link(url)}">{name}</a></li>')
+        h.append("</ul>")
+    return "\n".join(h).encode()
+
+
 # ------------------------------------------- переходник GET→POST для базы ПМВ
 # Поиск на портале Первой мировой устроен через POST к его внутреннему шлюзу
 # (builderType=Heroes), а чат умеет только GET. Переходник строит запрос САМ
@@ -119,7 +214,8 @@ def gwar_search(params):
     for h in hits.get("hits", []):
         s = h.get("_source", {})
         rec = {k: s[k] for k in GWAR_OUT if s.get(k)}
-        rec["карточка"] = f"https://gwar.mil.ru/heroes/{h.get('_type','')}{s.get('id','')}/"
+        card = f"https://gwar.mil.ru/heroes/{h.get('_type','')}{s.get('id','')}/"
+        rec["карточка"] = gw_link(card)      # сразу в форме шлюза: иначе не открыть
         out.append(rec)
     total = hits.get("total")
     if isinstance(total, dict):
@@ -216,6 +312,14 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def fetch(self, target):
         if not target:
+            body = entry_page()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if False:
             return self.json_out(400, {
                 "error": "адрес не получен",
                 "подсказка": "строку запроса режут некоторые загрузчики — передавайте "
@@ -252,6 +356,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return
         if len(data) > MAXSIZE:
             return self.deny(413)
+        if "html" in ct.lower():
+            data = rewrite_html(data, target)
         self.send_response(code)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(data)))
@@ -272,6 +378,7 @@ class Srv(http.server.ThreadingHTTPServer):
 if __name__ == "__main__":
     if not TOKEN or len(TOKEN) < 24:
         sys.exit("GW_TOKEN не задан или короче 24 символов")
-    print(f"шлюз на :{PORT}, доменов в списке: {len(ALLOW)}, "
+    print(f"шлюз на :{PORT}, база ссылок: {BASE or '(относительные)'}, "
+          f"доменов в списке: {len(ALLOW)}, "
           f"бандл: {'есть' if os.path.exists(BUNDLE) else 'нет'}", flush=True)
     Srv(("0.0.0.0", PORT), H).serve_forever()
