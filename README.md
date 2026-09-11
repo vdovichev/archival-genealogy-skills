@@ -1,13 +1,12 @@
 # Архивный генеалогический поиск — навыки для ИИ-ассистента
 
 *Skills for archival genealogy research in Eastern Europe (Russia, Belarus, Lithuania,
-Ukraine, Latvia, Poland): methodology, a catalogue of 111 sources, connector protocols,
+Ukraine, Latvia, Poland): methodology, a catalogue of 117 sources, connector protocols,
 handwriting palaeography (Cyrillic скоропись + Polish/Latin), and Python tooling.
 Documentation in Russian.*
 
-Два независимых скилла, упакованных из практики реальных исследований
-(православные крестьяне Центральной России, старообрядцы Поволжья, литовская
-застянковая шляхта, белорусская шляхта). Личные данные исследований не включены.
+Два независимых скилла, упакованных из практики реальных исследований по разным
+сословиям и конфессиям Восточной Европы. Личные данные исследований не включены.
 
 | Скилл | Про что |
 |---|---|

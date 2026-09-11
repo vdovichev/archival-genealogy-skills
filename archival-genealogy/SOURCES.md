@@ -45,7 +45,7 @@ GET  /ajax/pages/<N>?...              → последнее число = чис
 Так работают: РГИА, ряд областных архивов, региональные порталы Альт-Софт.
 
 🔑 **Вариант с `private_api` (личный кабинет).** На части установок — проверено на
-`vladimir.kaisa.ru` (ГАВО-Владимир) — поверх этого есть JSON-API кабинета:
+областном архиве с платным абонементом — поверх этого есть JSON-API кабинета:
 ```
 POST /private_api/get-object       {"objectId":<id>,"languageId":1}
 POST /private_api/get-object-list  поиск по шифру, attributeId 6725842, condition 12
